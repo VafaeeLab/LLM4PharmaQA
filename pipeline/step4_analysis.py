@@ -34,7 +34,7 @@ def calculate_t_confidence_interval(data, confidence=0.95):
 
     sample_mean = np.mean(sample_array)
     standard_error = np.std(sample_array, ddof=1) / np.sqrt(n)  # Standard error of the mean (using sample std)
-    t_value = stats.t.ppf((1 - confidence) / 2, n - 1)
+    t_value = stats.t.ppf((1 + confidence) / 2, n - 1)
     margin_of_error = t_value * standard_error
 
     lower_bound = sample_mean - margin_of_error
@@ -329,16 +329,26 @@ def calculate_all_model_metrics(model_name, model_info, metrics_list, use_no_err
 # =========================================
 # Apply calculations to all models
 # =========================================
-print("\n=== Calculating metrics for all models ===")
-all_model_results = []
+# print("\n=== Calculating metrics for all models ===")
+# all_model_results = []
 
-for model_name, model_info in models.items():
-    results = calculate_all_model_metrics(model_name, model_info, metrics_list, use_no_error=True)
-    all_model_results.append(results)
-    print(f"Completed calculations for {model_name}")
+# for model_name, model_info in models.items():
+#     results = calculate_all_model_metrics(model_name, model_info, metrics_list, use_no_error=True)
+#     all_model_results.append(results)
+#     print(f"Completed calculations for {model_name}")
 
+# pprint.pprint(all_model_results)
 
-pprint.pprint(all_model_results)
+def bootstrap_ci(data, n_bootstrap=10000, ci=95):
+    boot_means = []
+    n = len(data)
+    for _ in range(n_bootstrap):
+        sample = np.random.choice(data, size=n, replace=True)
+        boot_means.append(np.mean(sample))
+    alpha = (100 - ci) / 2
+    lower = np.percentile(boot_means, alpha)
+    upper = np.percentile(boot_means, 100 - alpha)
+    return lower, upper
 
 
 def run_wilcoxon_signed_for_metric(models, metric_name, use_no_error=True, alpha=0.05):
@@ -393,30 +403,45 @@ def run_wilcoxon_signed_for_metric(models, metric_name, use_no_error=True, alpha
 
         n = len(paired)
 
-        if n < 2:
-            print(f"{m1} vs {m2}: not enough paired data (n = {n})")
-            continue
+        diffs = x - y # mean difference
+    # Mean difference
+        mean_diff = np.mean(diffs)
+
+        # # Bootstrap CI
+        # ci_lower, ci_upper = bootstrap_ci(diffs)      
+        # if n < 2:
+        #     print(f"{m1} vs {m2}: not enough paired data (n = {n})")
+        #     continue
+
+        # USING T TEST FOR CONFIDENCE INTERVAL
+        mean_diff, lower, upper, standard_error, n = calculate_t_confidence_interval(diffs, confidence=0.95)
 
         # Wilcoxon signed-rank test (paired, 2-sided)
         # Note: wilcoxon drops zero-differences internally.
-        w_stat, p_raw = stats.wilcoxon(x, y, alternative="two-sided", zero_method="wilcox")
+        t_stat, p_raw = stats.ttest_rel(x, y, nan_policy="omit")    
 
         p_bonf = min(p_raw * m, 1.0)
 
         result = {
+            "mean_diff": mean_diff,
+            "ci_lower": lower,
+            "ci_upper": upper,
+            "standard_error": standard_error,
+            "n": n,
             "metric": metric_name,
             "model_1": m1,
             "model_2": m2,
-            "w_stat": w_stat,
+            "t_stat": t_stat,
             "p_raw": p_raw,
             "p_bonf": p_bonf,
             "n_paired": n,
-            "alpha": alpha
+            "alpha": alpha,
+            "m": m,
         }
         results.append(result)
 
         print(
-            f"{m1} vs {m2}: W = {w_stat:.4f}, "
+            f"{m1} vs {m2}: W = {t_stat:.4f}, "
             f"p_raw = {p_raw:.4g}, p_bonf = {p_bonf:.4g} "
             f"(n_paired = {n})"
         )
@@ -468,8 +493,12 @@ def run_wilcoxon_for_metric(models, metric_name, use_no_error=True, alpha=0.05):
         if len(x) >= 2 and len(y) >= 2:
             u_stat, p_raw = stats.mannwhitneyu(x, y, alternative="two-sided")
             p_bonf = min(p_raw * m, 1.0)  # Bonferroni correction
+            
+            # Calculate mean difference (unpaired: mean(x) - mean(y))
+            mean_diff = np.mean(x) - np.mean(y)
 
             result = {
+                "mean_diff": mean_diff,
                 "metric": metric_name,
                 "model_1": m1,
                 "model_2": m2,
@@ -496,300 +525,104 @@ def run_wilcoxon_for_metric(models, metric_name, use_no_error=True, alpha=0.05):
     return results
 
 
-# =========================================
-# Category-based analysis functions
-# =========================================
-
-def get_model_category(model_name):
-    """
-    Extract category from model name.
-    
-    Args:
-        model_name (str): Model name (e.g., "deepseek-r1-1.5", "llama3-8b", "med42-70b")
-    
-    Returns:
-        str: Category name (e.g., "deepseek", "llama", "med42")
-    """
-    model_lower = model_name.lower()
-    
-    if "deepseek" in model_lower:
-        return "deepseek"
-    elif "llama" in model_lower:
-        return "llama"
-    elif "med42" in model_lower or "medv2" in model_lower:
-        return "med42"
-    else:
-        # Default: use first part of name before first dash or underscore
-        parts = model_name.replace("_", "-").split("-")
-        return parts[0].lower()
 
 
-def group_models_by_category(models):
-    """
-    Group models by their category.
-    
-    Args:
-        models (dict): Dictionary of model information
-    
-    Returns:
-        dict: Dictionary mapping category names to lists of model names
-    """
-    categories = {}
-    for model_name in models.keys():
-        category = get_model_category(model_name)
-        if category not in categories:
-            categories[category] = []
-        categories[category].append(model_name)
-    return categories
-
-
-def get_category_metric_values(models, category, metric_name, use_no_error=True):
-    """
-    Aggregate all metric values from all models in a category.
-    
-    Args:
-        models (dict): Dictionary of model information
-        category (str): Category name
-        metric_name (str): Metric name (e.g., "accuracy", "weighted_normalized_score")
-        use_no_error (bool): Whether to use df_no_error_norm (True) or df_norm (False)
-    
-    Returns:
-        np.array: Array of all metric values from all models in the category
-    """
-    df_key = "df_no_error_norm" if use_no_error else "df_norm"
-    all_values = []
-    
-    category_models = [m for m in models.keys() if get_model_category(m) == category]
-    
-    for model_name in category_models:
-        df = models[model_name][df_key]
-        col = f"{model_name}_{metric_name}"
-        if col in df.columns:
-            values = df[col].dropna().astype(float).values
-            all_values.extend(values)
-    
-    return np.array(all_values)
-
-
-def run_wilcoxon_for_category_metric(models, metric_name, use_no_error=True, alpha=0.05):
-    """
-    Run pairwise 2-tailed Wilcoxon rank-sum (Mann–Whitney U) tests
-    across model categories for a given metric, with Bonferroni correction.
-    
-    Args:
-        models (dict): Dictionary of model information
-        metric_name (str): Metric name (e.g., "accuracy", "weighted_normalized_score")
-        use_no_error (bool): Whether to use df_no_error_norm (True) or df_norm (False)
-        alpha (float): Nominal significance level
-    
-    Returns:
-        list of dict: One entry per pairwise category comparison with raw and Bonferroni-corrected p-values
-    """
-    categories_dict = group_models_by_category(models)
-    category_names = list(categories_dict.keys())
-    
-    pairs = list(combinations(category_names, 2))
-    m = len(pairs)  # number of comparisons for Bonferroni
-    
-    results = []
-    
-    dataset_label = "df_no_error_norm" if use_no_error else "df_norm"
-    print(f"\n=== Wilcoxon rank-sum tests for metric '{metric_name}' by CATEGORY "
-          f"using {dataset_label} (2-tailed, Bonferroni corrected) ===")
-    print(f"Categories: {category_names}")
-    print(f"Category groupings: {categories_dict}")
-    
-    for cat1, cat2 in pairs:
-        x = get_category_metric_values(models, cat1, metric_name, use_no_error)
-        y = get_category_metric_values(models, cat2, metric_name, use_no_error)
-        
-        if len(x) >= 2 and len(y) >= 2:
-            u_stat, p_raw = stats.mannwhitneyu(x, y, alternative="two-sided")
-            p_bonf = min(p_raw * m, 1.0)  # Bonferroni correction
-            
-            result = {
-                "metric": metric_name,
-                "category_1": cat1,
-                "category_2": cat2,
-                "u_stat": u_stat,
-                "p_raw": p_raw,
-                "p_bonf": p_bonf,
-                "n1": len(x),
-                "n2": len(y),
-                "alpha": alpha
-            }
-            results.append(result)
-            
-            print(
-                f"{cat1} vs {cat2}: U = {u_stat:.4f}, "
-                f"p_raw = {p_raw:.4g}, p_bonf = {p_bonf:.4g} "
-                f"(n1 = {len(x)}, n2 = {len(y)})"
-            )
-        else:
-            print(
-                f"{cat1} vs {cat2}: not enough data "
-                f"(n1 = {len(x)}, n2 = {len(y)})"
-            )
-    
-    return results
-
-
-def run_wilcoxon_signed_for_category_metric(models, metric_name, use_no_error=True, alpha=0.05):
-    """
-    Run pairwise 2-tailed Wilcoxon signed-rank tests across model categories
-    for a given metric, with Bonferroni correction.
-    
-    This assumes models within each category are evaluated on the SAME item set (paired design).
-    We pair corresponding items across categories (e.g., item 1 from all llama models vs item 1 from all deepseek models).
-    
-    Args:
-        models (dict): Dictionary of model information
-        metric_name (str): Metric name (e.g., "accuracy", "weighted_normalized_score")
-        use_no_error (bool): Whether to use df_no_error_norm (True) or df_norm (False)
-        alpha (float): Nominal significance level
-    
-    Returns:
-        list of dict: One entry per pairwise category comparison with raw and Bonferroni-corrected p-values
-    """
-    categories_dict = group_models_by_category(models)
-    category_names = list(categories_dict.keys())
-    
-    pairs = list(combinations(category_names, 2))
-    m = len(pairs)  # number of comparisons for Bonferroni
-    
-    results = []
-    
-    df_key = "df_no_error_norm" if use_no_error else "df_norm"
-    print(f"\n=== Wilcoxon signed-rank tests for metric '{metric_name}' by CATEGORY "
-          f"using {df_key} (2-tailed, Bonferroni corrected) ===")
-    print(f"Categories: {category_names}")
-    print(f"Category groupings: {categories_dict}")
-    
-    for cat1, cat2 in pairs:
-        # Get all models in each category
-        cat1_models = categories_dict[cat1]
-        cat2_models = categories_dict[cat2]
-        
-        # Collect paired values (same row index across models in each category)
-        paired_values = []
-        
-        # Use the first model's dataframe to get row indices
-        if cat1_models and cat2_models:
-            df1_ref = models[cat1_models[0]][df_key]
-            df2_ref = models[cat2_models[0]][df_key]
-            
-            # Find common indices
-            common_indices = df1_ref.index.intersection(df2_ref.index)
-            
-            for idx in common_indices:
-                # Get mean value across all models in category 1 for this row
-                cat1_values = []
-                for model_name in cat1_models:
-                    df = models[model_name][df_key]
-                    col = f"{model_name}_{metric_name}"
-                    if col in df.columns and idx in df.index:
-                        val = df.loc[idx, col]
-                        if pd.notna(val):
-                            cat1_values.append(float(val))
-                
-                # Get mean value across all models in category 2 for this row
-                cat2_values = []
-                for model_name in cat2_models:
-                    df = models[model_name][df_key]
-                    col = f"{model_name}_{metric_name}"
-                    if col in df.columns and idx in df.index:
-                        val = df.loc[idx, col]
-                        if pd.notna(val):
-                            cat2_values.append(float(val))
-                
-                # If both categories have at least one valid value, use the mean
-                if cat1_values and cat2_values:
-                    paired_values.append((np.mean(cat1_values), np.mean(cat2_values)))
-        
-        if len(paired_values) >= 2:
-            x = np.array([p[0] for p in paired_values])
-            y = np.array([p[1] for p in paired_values])
-            
-            w_stat, p_raw = stats.wilcoxon(x, y, alternative="two-sided", zero_method="wilcox")
-            p_bonf = min(p_raw * m, 1.0)
-            
-            result = {
-                "metric": metric_name,
-                "category_1": cat1,
-                "category_2": cat2,
-                "w_stat": w_stat,
-                "p_raw": p_raw,
-                "p_bonf": p_bonf,
-                "n_paired": len(paired_values),
-                "alpha": alpha
-            }
-            results.append(result)
-            
-            print(
-                f"{cat1} vs {cat2}: W = {w_stat:.4f}, "
-                f"p_raw = {p_raw:.4g}, p_bonf = {p_bonf:.4g} "
-                f"(n_paired = {len(paired_values)})"
-            )
-        else:
-            print(
-                f"{cat1} vs {cat2}: not enough paired data "
-                f"(n_paired = {len(paired_values)})"
-            )
-    
-    return results
-
-
-# Individual model comparisons - run Wilcoxon tests for all metrics
-print("\n" + "="*80)
-print("INDIVIDUAL MODEL COMPARISONS - WILCOXON RANK-SUM TESTS")
-print("="*80)
-for metric in metrics_list:
-    print(f"\n--- Metric: {metric} ---")
-    results = run_wilcoxon_for_metric(models, metric)
-    pprint.pprint(results)
-
-print("\n" + "="*80)
-print("INDIVIDUAL MODEL COMPARISONS - WILCOXON SIGNED-RANK TESTS")
-print("="*80)
-for metric in metrics_list:
-    print(f"\n--- Metric: {metric} ---")
-    results = run_wilcoxon_signed_for_metric(models, metric)
-    pprint.pprint(results)
 
 # Weighted normalized score (separate since it's not in metrics_list)
 print("\n" + "="*80)
 print("INDIVIDUAL MODEL COMPARISONS - WEIGHTED NORMALIZED SCORE")
 print("="*80)
-print("--- Wilcoxon Rank-Sum Test ---")
-pprint.pprint(run_wilcoxon_for_metric(models, "weighted_normalized_score"))
 print("--- Wilcoxon Signed-Rank Test ---")
 pprint.pprint(run_wilcoxon_signed_for_metric(models, "weighted_normalized_score"))
 
-# Category-based analysis - run Wilcoxon tests for all metrics
-print("\n" + "="*80)
-print("CATEGORY-BASED ANALYSIS - WILCOXON RANK-SUM TESTS")
-print("="*80)
-for metric in metrics_list:
-    print(f"\n--- Metric: {metric} ---")
-    results = run_wilcoxon_for_category_metric(models, metric)
-    pprint.pprint(results)
 
-print("\n" + "="*80)
-print("CATEGORY-BASED ANALYSIS - WILCOXON SIGNED-RANK TESTS")
-print("="*80)
-for metric in metrics_list:
-    print(f"\n--- Metric: {metric} ---")
-    results = run_wilcoxon_signed_for_category_metric(models, metric)
-    pprint.pprint(results)
 
-# Weighted normalized score for categories
+
+
+
+def paired_t_test(metric_name, models, use_no_error=True, alpha=0.05):
+    """
+    Calculate the mean difference in accuracy between models.
+    """
+    model_names = list(models.keys())
+    df_key = "df_no_error_norm" if use_no_error else "df_norm"
+
+    pairs = list(combinations(model_names, 2))
+    m = len(pairs)  # number of comparisons for Bonferroni
+
+    results = []
+
+    for m1, m2 in pairs:
+        df1 = models[m1][df_key]
+        df2 = models[m2][df_key]
+
+        col1 = f"{m1}_{metric_name}"
+        col2 = f"{m2}_{metric_name}"
+
+        if col1 not in df1.columns or col2 not in df2.columns:
+            print(f"{m1} vs {m2}: metric column missing ({col1} or {col2})")
+            continue
+
+        # Align on index and keep only rows where BOTH are non-NaN
+        paired = pd.concat(
+            [df1[col1], df2[col2]],
+            axis=1,
+            keys=["x", "y"]
+        ).dropna()
+
+        x = paired["x"].astype(float).values
+        y = paired["y"].astype(float).values
+
+        n = len(paired)
+
+        diffs = x - y # mean difference
+        mean_diff, lower, upper, standard_error, n = calculate_t_confidence_interval(diffs, confidence=0.95)
+        
+        if n < 2:
+            print(f"{m1} vs {m2}: not enough paired data (n = {n})")
+            continue
+
+        # Wilcoxon signed-rank test (paired, 2-sided)
+        # Note: wilcoxon drops zero-differences internally.
+        w_stat, p_raw = stats.wilcoxon(x, y, alternative="two-sided", zero_method="wilcox")
+
+        p_bonf = min(p_raw * m, 1.0)
+
+        result = {
+            "mean_diff": mean_diff,
+            "ci_lower": lower,
+            "ci_upper": upper,
+            "standard_error": standard_error,
+            "n": n,
+            "metric": metric_name,
+            "model_1": m1,
+            "model_2": m2,
+            "w_stat": w_stat,
+            "p_raw": p_raw,
+            "p_bonf": p_bonf,
+            "n_paired": n,
+            "alpha": alpha,
+            "m": m,
+        }
+        results.append(result)
+
+        print(
+            f"{m1} vs {m2}: W = {w_stat:.4f}, "
+            f"p_raw = {p_raw:.4g}, p_bonf = {p_bonf:.4g} "
+            f"(n_paired = {n})"
+        )
+
+    return results
+
+
+
+# Accuracy (separate since it's handled differently)
 print("\n" + "="*80)
-print("CATEGORY-BASED ANALYSIS - WEIGHTED NORMALIZED SCORE")
+print("INDIVIDUAL MODEL COMPARISONS - ACCURACY")
 print("="*80)
-print("--- Wilcoxon Rank-Sum Test ---")
-pprint.pprint(run_wilcoxon_for_category_metric(models, "weighted_normalized_score"))
-print("--- Wilcoxon Signed-Rank Test ---")
-pprint.pprint(run_wilcoxon_signed_for_category_metric(models, "weighted_normalized_score"))
+print("--- Paired T Test ---")
+pprint.pprint(paired_t_test("accuracy", models))
+
 
 # Calculate if there is a significant difference in performance between models - for accuracy, f1 score, each metric and weighted normalized scores    
 # two sample t test with 0.05 significance level and bonferroni correction
